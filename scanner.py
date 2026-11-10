@@ -239,16 +239,17 @@ def fetch_bse(seen, first_run, today):
             # stop once everything is fetched (or, on frequent runs, once pages hold nothing new)
             if stale_pages >= STALE_PAGE_LIMIT or (total and fetched >= total):
                 break
-    return items
+    return items, fetched
 
 
 def fetch_nse(seen, first_run, today):
     from nse import NSE
     start = today if first_run else today - timedelta(days=1)
-    items = []
+    items, listed = [], 0
     with NSE(download_folder=tempfile.mkdtemp()) as api:
         for index in ("equities", "sme"):
             rows = api.announcements(index=index, from_date=start, to_date=today)
+            listed += len(rows or [])
             for r in rows or []:
                 raw = r.get("seq_id") or (r.get("symbol"), r.get("an_dt"), r.get("desc"))
                 sid = short_id("N", raw)
@@ -266,7 +267,7 @@ def fetch_nse(seen, first_run, today):
                     "pdfs": [att] if att.lower().endswith(".pdf") else [],
                     "page": "",
                 })
-    return items
+    return items, listed
 
 
 # --- email -------------------------------------------------------------------
@@ -450,7 +451,9 @@ def load_state():
 
 def send_summary(day, mailer, as_of):
     nse_total = day["nse_ok"] + day["nse_fail"]
-    if not nse_total or day["nse_fail"] == nse_total:
+    if nse_total and not day["nse_fail"] and not day.get("new_NSE"):
+        nse = "connected but returned no filings - treat coverage as BSE only"
+    elif not nse_total or day["nse_fail"] == nse_total:
         nse = "NOT reachable today - coverage was BSE only"
     elif day["nse_fail"]:
         nse = "reachable on %d of %d checks" % (day["nse_ok"], nse_total)
@@ -459,7 +462,8 @@ def send_summary(day, mailer, as_of):
     lines = [
         "Scanner is running. Summary for %s%s:" % (day["date"], as_of),
         "",
-        "Announcements scanned : %d" % day["scanned"],
+        "Announcements scanned : %d (BSE %d, NSE %d)" % (
+            day["scanned"], day.get("new_BSE", 0), day.get("new_NSE", 0)),
         "Preferential alerts   : %d" % day["pref"],
         "SAST alerts           : %d" % day["sast"],
         "NSE feed              : %s" % nse,
@@ -498,23 +502,31 @@ def main():
 
     # 1. fetch
     items = []
+    listed = {"BSE": 0, "NSE": 0}
     fixture = os.environ.get("SCANNER_FIXTURE")
     if fixture:
         with open(fixture) as fh:
             items = [i for i in json.load(fh) if i["id"] not in state["seen"]]
     else:
         try:
-            items += fetch_bse(state["seen"], first_run, today)
+            got, listed["BSE"] = fetch_bse(state["seen"], first_run, today)
+            items += got
         except Exception as exc:
             failed = True
             print("BSE fetch failed:", type(exc).__name__, str(exc)[:200])
         try:
-            items += fetch_nse(state["seen"], first_run, today)
+            got, listed["NSE"] = fetch_nse(state["seen"], first_run, today)
+            items += got
             day["nse_ok"] += 1
         except Exception as exc:
             day["nse_fail"] += 1
             print("NSE not reachable this run:", type(exc).__name__)
     day["scanned"] += len(items)
+    for exch in ("BSE", "NSE"):
+        day["new_" + exch] = day.get("new_" + exch, 0) + sum(
+            1 for i in items if i["exch"] == exch)
+    print("BSE listed: %d | NSE listed: %d (filings on each exchange's feed for the "
+          "period checked, including ones seen before)" % (listed["BSE"], listed["NSE"]))
 
     # 2. queue the interesting ones
     jobs = state["pending"]
