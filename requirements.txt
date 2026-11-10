@@ -1,0 +1,7 @@
+bse==3.3.4
+nse==5.1.0
+requests>=2.31
+pypdf==5.9.0
+pypdfium2==4.30.0
+pytesseract==0.3.13
+Pillow>=10
