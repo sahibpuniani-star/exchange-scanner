@@ -33,6 +33,8 @@ TIME_BUDGET = int(os.environ.get("TIME_BUDGET_SECONDS", "210"))
 MAX_DOCS = int(os.environ.get("MAX_DOCS_PER_RUN", "60"))
 MAX_PDF_BYTES = 25 * 1024 * 1024
 STALE_PAGE_LIMIT = int(os.environ.get("STALE_PAGE_LIMIT", "2"))
+BSE_RETRIES = int(os.environ.get("BSE_RETRIES", "4"))
+BSE_RETRY_WAIT = int(os.environ.get("BSE_RETRY_WAIT_SECONDS", "60"))
 SUMMARY_HOUR = int(os.environ.get("SUMMARY_HOUR_IST", "21"))
 UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
       "(KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36")
@@ -192,23 +194,38 @@ def short_id(prefix, raw):
     return prefix + hashlib.sha1(str(raw).encode()).hexdigest()[:12]
 
 
-def fetch_bse(seen, first_run, today):
+def bse_row(r, sid):
+    att = (r.get("ATTACHMENTNAME") or "").strip()
+    base = "https://www.bseindia.com/xml-data/corpfiling/"
+    return {
+        "id": sid, "exch": "BSE",
+        "company": (r.get("SLONGNAME") or "").strip(),
+        "code": str(r.get("SCRIP_CD") or ""),
+        "subject": r.get("NEWSSUB") or "",
+        "summary": " ".join(filter(None, [r.get("HEADLINE"), r.get("MORE")])),
+        "category": " ".join(filter(None, [r.get("CATEGORYNAME"), r.get("SUBCATNAME")])),
+        "time": str(r.get("DissemDT") or r.get("NEWS_DT") or "")[:19],
+        "pdfs": [base + "AttachLive/" + att, base + "AttachHis/" + att] if att else [],
+        "page": r.get("NSURL") or "",
+    }
+
+
+def fetch_bse_day(day, seen):
+    """All equity announcements BSE lists for one date. Returns (new items, rows listed)."""
     from bse import BSE
-    start = today if first_run else today - timedelta(days=1)
-    frm = datetime(start.year, start.month, start.day)
-    to = datetime(today.year, today.month, today.day)
+    when = datetime(day.year, day.month, day.day)
     items, fetched, stale_pages = [], 0, 0
     with BSE(download_folder=tempfile.mkdtemp()) as api:
         for page in range(1, 301):
             data = None
             for attempt in range(3):
                 try:
-                    data = api.announcements(page_no=page, from_date=frm, to_date=to)
+                    data = api.announcements(page_no=page, from_date=when, to_date=when)
                     break
                 except Exception:
                     if attempt == 2:
                         raise
-                    time.sleep(3)
+                    time.sleep(5)
             rows = data.get("Table") or []
             if not rows:
                 break
@@ -219,37 +236,42 @@ def fetch_bse(seen, first_run, today):
                 if sid in seen:
                     continue
                 fresh += 1
-                att = (r.get("ATTACHMENTNAME") or "").strip()
-                base = "https://www.bseindia.com/xml-data/corpfiling/"
-                items.append({
-                    "id": sid, "exch": "BSE",
-                    "company": (r.get("SLONGNAME") or "").strip(),
-                    "code": str(r.get("SCRIP_CD") or ""),
-                    "subject": r.get("NEWSSUB") or "",
-                    "summary": " ".join(filter(None, [r.get("HEADLINE"), r.get("MORE")])),
-                    "category": " ".join(filter(None, [r.get("CATEGORYNAME"),
-                                                       r.get("SUBCATNAME")])),
-                    "time": str(r.get("DissemDT") or r.get("NEWS_DT") or "")[:19],
-                    "pdfs": [base + "AttachLive/" + att,
-                             base + "AttachHis/" + att] if att else [],
-                    "page": r.get("NSURL") or "",
-                })
+                items.append(bse_row(r, sid))
             stale_pages = 0 if fresh else stale_pages + 1
             total = ((data.get("Table1") or [{}])[0] or {}).get("ROWCNT") or 0
-            # stop once everything is fetched (or, on frequent runs, once pages hold nothing new)
             if stale_pages >= STALE_PAGE_LIMIT or (total and fetched >= total):
                 break
     return items, fetched
 
 
-def fetch_nse(seen, first_run, today):
+def fetch_bse(seen, days):
+    """Each date is asked for separately; an empty answer is retried, because BSE
+    sometimes replies to a cloud server with nothing instead of an error."""
+    items, counts = [], {}
+    for day in days:
+        got, listed = [], 0
+        for attempt in range(BSE_RETRIES):
+            got, listed = fetch_bse_day(day, seen)
+            if listed:
+                break
+            if attempt < BSE_RETRIES - 1:
+                time.sleep(BSE_RETRY_WAIT)
+        counts[day.strftime("%d-%b")] = listed
+        # a page of nothing-new must not hide later days, so de-duplicate here
+        known = {i["id"] for i in items}
+        items += [i for i in got if i["id"] not in known]
+    if not counts.get(days[-1].strftime("%d-%b")):
+        raise RuntimeError("BSE returned no announcements for today: %s" % counts)
+    return items, counts
+
+
+def fetch_nse(seen, start, today):
     from nse import NSE
-    start = today if first_run else today - timedelta(days=1)
-    items, listed = [], 0
+    items, listed = [], {}
     with NSE(download_folder=tempfile.mkdtemp()) as api:
         for index in ("equities", "sme"):
             rows = api.announcements(index=index, from_date=start, to_date=today)
-            listed += len(rows or [])
+            listed[index] = len(rows or [])
             for r in rows or []:
                 raw = r.get("seq_id") or (r.get("symbol"), r.get("an_dt"), r.get("desc"))
                 sid = short_id("N", raw)
@@ -466,6 +488,10 @@ def send_summary(day, mailer, as_of):
             day["scanned"], day.get("new_BSE", 0), day.get("new_NSE", 0)),
         "Preferential alerts   : %d" % day["pref"],
         "SAST alerts           : %d" % day["sast"],
+        "BSE feed              : %s" % (
+            "OK" if day.get("bse", "OK") == "OK" else
+            "FAILED - BSE filings were NOT checked in this run. The next run "
+            "catches up automatically; you can also press Run workflow now."),
         "NSE feed              : %s" % nse,
     ]
     unread = day["unread_sast"]
@@ -473,11 +499,25 @@ def send_summary(day, mailer, as_of):
         lines += ["", "SAST filings that could not be read automatically (%d) - "
                       "names were not checked, open these yourself:" % len(unread)]
         lines += ["  %s  %s" % (c, u) for c, u in unread[:150]]
-    mailer.send("Scanner daily summary %s: %d pref, %d SAST" %
-                (day["date"], day["pref"], day["sast"]), "\n".join(lines))
+    flag = "" if day.get("bse", "OK") == "OK" else "BSE FAILED - "
+    mailer.send("%sScanner daily summary %s: %d pref, %d SAST" %
+                (flag, day["date"], day["pref"], day["sast"]), "\n".join(lines))
 
 
 # --- main --------------------------------------------------------------------
+def catch_up_days(last_ok, today, first_run):
+    """Dates to ask for: from the last night that worked (so a failed night is
+    caught up automatically), at most 5 days back."""
+    start = today if first_run else today - timedelta(days=1)
+    if last_ok:
+        try:
+            start = min(start, datetime.strptime(last_ok, "%Y-%m-%d").date())
+        except ValueError:
+            pass
+    start = max(start, today - timedelta(days=5))
+    return [start + timedelta(days=n) for n in range((today - start).days + 1)]
+
+
 def main():
     started = time.time()
     deadline = started + TIME_BUDGET
@@ -509,15 +549,22 @@ def main():
             items = [i for i in json.load(fh) if i["id"] not in state["seen"]]
     else:
         try:
-            got, listed["BSE"] = fetch_bse(state["seen"], first_run, today)
+            days = catch_up_days(state.get("bse_ok"), today, first_run)
+            got, listed["BSE"] = fetch_bse(state["seen"], days)
             items += got
+            state["bse_ok"] = today_str
+            day["bse"] = "OK"
         except Exception as exc:
             failed = True
+            day["bse"] = "FAILED"
             print("BSE fetch failed:", type(exc).__name__, str(exc)[:200])
         try:
-            got, listed["NSE"] = fetch_nse(state["seen"], first_run, today)
+            days = catch_up_days(state.get("nse_ok"), today, first_run)
+            got, listed["NSE"] = fetch_nse(state["seen"], days[0], today)
             items += got
             day["nse_ok"] += 1
+            if sum(listed["NSE"].values()):
+                state["nse_ok"] = today_str
         except Exception as exc:
             day["nse_fail"] += 1
             print("NSE not reachable this run:", type(exc).__name__)
@@ -525,8 +572,8 @@ def main():
     for exch in ("BSE", "NSE"):
         day["new_" + exch] = day.get("new_" + exch, 0) + sum(
             1 for i in items if i["exch"] == exch)
-    print("BSE listed: %d | NSE listed: %d (filings on each exchange's feed for the "
-          "period checked, including ones seen before)" % (listed["BSE"], listed["NSE"]))
+    print("Filings listed by each feed for the dates checked (including ones seen "
+          "before) - BSE: %s | NSE: %s" % (listed["BSE"] or "nothing", listed["NSE"] or "nothing"))
 
     # 2. queue the interesting ones
     jobs = state["pending"]
@@ -556,7 +603,7 @@ def main():
     state["pending"] = [j for j in remaining if j.get("queued", today_str) >= cutoff]
 
     # 4. daily summary
-    if now.hour >= SUMMARY_HOUR and not day["summary_sent"] and not failed:
+    if now.hour >= SUMMARY_HOUR and not day["summary_sent"]:
         try:
             send_summary(day, mailer, " (as of %s IST)" % now.strftime("%H:%M"))
             day["summary_sent"] = True
@@ -564,7 +611,7 @@ def main():
             print("summary email failed:", type(exc).__name__)
 
     # 5. tidy up and save
-    keep = (today - timedelta(days=2)).strftime("%Y-%m-%d")
+    keep = (today - timedelta(days=7)).strftime("%Y-%m-%d")
     state["seen"] = {k: v for k, v in state["seen"].items() if v >= keep}
     state["alerted_on"] = {k: v for k, v in state["alerted_on"].items() if v >= keep}
     state["alerted"] = {k: v for k, v in state["alerted"].items()
