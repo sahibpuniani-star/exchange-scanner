@@ -1,0 +1,59 @@
+name: Exchange scanner
+
+on:
+  schedule:
+    - cron: "0 18 * * *"       # 18:00 UTC = 11:30 pm India time, every day
+  workflow_dispatch:            # lets you press "Run workflow" by hand
+
+permissions:
+  contents: write
+
+concurrency:
+  group: scanner
+  cancel-in-progress: false
+
+jobs:
+  scan:
+    runs-on: ubuntu-latest
+    timeout-minutes: 150
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install
+        run: |
+          (sudo apt-get update -qq && sudo apt-get install -y -qq tesseract-ocr) || echo "OCR not installed - scanned PDFs will be flagged for manual check"
+          pip install -q -r requirements.txt
+
+      - name: Restore memory of what was already seen
+        run: |
+          git fetch -q origin state --depth=1 2>/dev/null && git show FETCH_HEAD:state.json > state.json || echo "no saved state yet"
+
+      - name: Scan
+        env:
+          EMAIL_USER: ${{ secrets.EMAIL_USER }}
+          EMAIL_APP_PASSWORD: ${{ secrets.EMAIL_APP_PASSWORD }}
+          EMAIL_TO: ${{ secrets.EMAIL_TO }}
+          ALLOTTEE_NAMES: ${{ secrets.ALLOTTEE_NAMES }}
+          SAST_NAMES: ${{ secrets.SAST_NAMES }}
+          SAST_ALERT_ALL: ${{ vars.SAST_ALERT_ALL }}
+          TIME_BUDGET_SECONDS: "6600"     # one long nightly run
+          MAX_DOCS_PER_RUN: "20000"
+          STALE_PAGE_LIMIT: "100000"      # always read the full day
+        run: python scanner.py
+
+      - name: Save memory
+        if: always()
+        run: |
+          [ -s state.json ] || exit 0
+          git config user.name "scanner"
+          git config user.email "scanner@users.noreply.github.com"
+          git checkout -q --orphan state-tmp
+          git rm -rfq --cached .
+          git add -f state.json
+          git commit -qm "state"
+          git push -qf origin state-tmp:state
