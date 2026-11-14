@@ -296,10 +296,35 @@ def fetch_bse(seen, days):
     return items, counts
 
 
-def fetch_nse(seen, start, today):
+def nse_open():
+    """Opens NSE. If the site answers that it has moved to another nseindia
+    address, every request is pointed at that address and it is tried again."""
     from nse import NSE
+    try:
+        return NSE(download_folder=tempfile.mkdtemp())
+    except Exception as exc:
+        resp = getattr(exc, "response", None)
+        target = resp.headers.get("location", "") if resp is not None else ""
+        host = re.match(r"https://(www\.nseindia\.[a-z.]{2,6})(/|$)", target)
+        if not host or host.group(1) == "www.nseindia.com" or NSE_MOVED:
+            raise
+        NSE_MOVED.append(host.group(1))
+        from nse import transport
+        original = transport.Transport.request
+
+        def request(self, url, params=None):
+            return original(self, url.replace("//www.nseindia.com", "//" + NSE_MOVED[0]), params)
+        transport.Transport.request = request
+        print("NSE has moved to %s - using that address" % NSE_MOVED[0])
+        return NSE(download_folder=tempfile.mkdtemp())
+
+
+NSE_MOVED = []
+
+
+def fetch_nse(seen, start, today):
     items, listed = [], {}
-    with NSE(download_folder=tempfile.mkdtemp()) as api:
+    with nse_open() as api:
         for index in ("equities", "sme"):
             rows = api.announcements(index=index, from_date=start, to_date=today)
             listed[index] = len(rows or [])
@@ -326,9 +351,8 @@ def fetch_nse(seen, start, today):
 def fetch_nse_sast(seen, start, today):
     """NSE keeps Regulation 29 (SAST) disclosures in their own list, with the
     acquirer's name as data, so names are matched without opening a document."""
-    from nse import NSE
     items, listed = [], 0
-    with NSE(download_folder=tempfile.mkdtemp()) as api:
+    with nse_open() as api:
         data = api._transport.request(
             api.base_url + "/corporate-sast-reg29",
             params={"index": "equities",
@@ -635,11 +659,13 @@ def main():
             if sum(run["nse_counts"].values()):
                 state["nse_ok"] = today_str
                 run["nse"] = "OK"
+                if NSE_MOVED:
+                    run["nse_counts"]["via " + NSE_MOVED[0]] = 1
             else:
                 run["nse"] = "connected but returned no filings - coverage was BSE only"
         except Exception as exc:
             run["nse"] = "NOT reachable - coverage was BSE only"
-            print("NSE not reachable this run:", type(exc).__name__)
+            print("NSE not reachable this run:", type(exc).__name__, str(exc)[:200])
         if SAST_NAMES or SAST_ALERT_ALL:
             try:
                 got, n = fetch_nse_sast(state["seen"], days[0], today)
