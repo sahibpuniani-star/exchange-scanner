@@ -3,12 +3,12 @@
 BSE + NSE announcement scanner.
 
 Runs once a night. Every run it:
-  1. pulls all new equity announcements from BSE (and NSE when reachable),
-  2. emails an alert for every preferential issue announcement and checks the
-     document for the names on your allottee watchlist,
-  3. emails an alert for SAST / takeover disclosures that mention a name on
-     your SAST watchlist,
-  4. sends one summary email a day so you know it is still running.
+  1. pulls all new equity announcements from BSE and NSE (catching up on any
+     night that failed),
+  2. opens preferential issue and board meeting documents and emails you only
+     when a name on your allottee watchlist appears,
+  3. does the same for SAST / takeover disclosures and your SAST watchlist,
+  4. sends one summary email at the end, so you know it ran and what it covered.
 
 All settings come from environment variables (GitHub Secrets) - see SETUP.md.
 """
@@ -35,7 +35,6 @@ MAX_PDF_BYTES = 25 * 1024 * 1024
 STALE_PAGE_LIMIT = int(os.environ.get("STALE_PAGE_LIMIT", "2"))
 BSE_RETRIES = int(os.environ.get("BSE_RETRIES", "4"))
 BSE_RETRY_WAIT = int(os.environ.get("BSE_RETRY_WAIT_SECONDS", "60"))
-SUMMARY_HOUR = int(os.environ.get("SUMMARY_HOUR_IST", "21"))
 UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
       "(KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36")
 
@@ -63,6 +62,7 @@ def name_list(var):
 ALLOTTEE_NAMES = name_list("ALLOTTEE_NAMES")
 SAST_NAMES = name_list("SAST_NAMES")
 SAST_ALERT_ALL = os.environ.get("SAST_ALERT_ALL") == "1"
+PREF_ALERT_ALL = os.environ.get("PREF_ALERT_ALL") == "1"
 EMAIL_USER = os.environ.get("EMAIL_USER", "")
 EMAIL_PASS = os.environ.get("EMAIL_APP_PASSWORD", "").replace(" ", "")
 EMAIL_TO = [a.strip() for a in
@@ -76,6 +76,9 @@ SMTP_PORT = int(os.environ.get("SMTP_PORT", "") or "465")
 CANON = {"private": "pvt", "limited": "ltd", "&": "and"}
 FILLER = {"pvt", "ltd", "llp", "llc", "inc", "mr", "mrs", "ms", "shri", "smt",
           "and", "the", "huf", "m", "s", "dr"}
+# words that cannot sit in the middle of one person's name
+BREAK = FILLER | {"of", "by", "for", "to", "with", "in", "on", "at", "or", "from",
+                  "son", "wife", "daughter", "director", "name", "no"}
 
 
 def norm(text):
@@ -91,6 +94,7 @@ def match_names(names, text_norm):
     hay = " " + text_norm + " "
     words = text_norm.split()
     where = {}
+    squashed = None
     hits = []
     for name in names:
         n = norm(name)
@@ -101,8 +105,17 @@ def match_names(names, text_norm):
             ctx = hay[max(0, pos - 90): pos + len(n) + 90].strip()
             hits.append((name, "exact", ctx))
             continue
-        # looser: same words close together in any order (e.g. surname first)
-        toks = [t for t in n.split() if t not in FILLER]
+        # same letters with different spacing or hyphens ("Multi-Horizons")
+        tight = n.replace(" ", "")
+        if len(tight) >= 12:
+            if squashed is None:
+                squashed = text_norm.replace(" ", "")
+            if tight in squashed:
+                hits.append((name, "possible", "same letters, different spacing: " + name))
+                continue
+        # looser: the same words next to each other in any order, with at most one
+        # extra word in between (surname first, a middle name, an initial spelt out)
+        toks = [t for t in n.split() if t not in FILLER and len(t) > 1]
         if len(toks) < 2:
             continue
         if not where:
@@ -110,14 +123,31 @@ def match_names(names, text_norm):
                 where.setdefault(w, []).append(i)
         if any(t not in where for t in toks):
             continue
-        span = len(toks) + 2
         rare = min(toks, key=lambda t: len(where[t]))
         for p in where[rare]:
-            if all(any(abs(q - p) < span for q in where[t]) for t in toks):
+            seg = near_match(toks, words, p)
+            if seg:
                 ctx = " ".join(words[max(0, p - 12): p + 12])
                 hits.append((name, "possible", ctx))
                 break
     return hits
+
+
+def near_match(toks, words, p):
+    """True if every word of the name sits in one short run of words around p."""
+    n = len(toks)
+    for start in range(max(0, p - n), p + 1):
+        win = words[start: start + n + 1]
+        idx = [i for i, w in enumerate(win) if w in toks]
+        if not idx:
+            continue
+        seg = win[idx[0]: idx[-1] + 1]
+        if any(t not in seg for t in toks):
+            continue
+        extra = [w for w in seg if w not in toks]
+        if len(extra) <= 1 and all(w.isalpha() and w not in BREAK for w in extra):
+            return True
+    return False
 
 
 # --- reading documents -------------------------------------------------------
@@ -245,23 +275,24 @@ def fetch_bse_day(day, seen):
 
 
 def fetch_bse(seen, days):
-    """Each date is asked for separately; an empty answer is retried, because BSE
-    sometimes replies to a cloud server with nothing instead of an error."""
+    """Each date is asked for separately. A past date that comes back empty is
+    retried, because BSE sometimes answers a cloud server with nothing. The last
+    date may honestly be empty (the run often starts just after midnight)."""
     items, counts = [], {}
-    for day in days:
+    for n, day in enumerate(days):
+        tries = BSE_RETRIES if n < len(days) - 1 else 1
         got, listed = [], 0
-        for attempt in range(BSE_RETRIES):
+        for attempt in range(tries):
             got, listed = fetch_bse_day(day, seen)
             if listed:
                 break
-            if attempt < BSE_RETRIES - 1:
+            if attempt < tries - 1:
                 time.sleep(BSE_RETRY_WAIT)
         counts[day.strftime("%d-%b")] = listed
-        # a page of nothing-new must not hide later days, so de-duplicate here
         known = {i["id"] for i in items}
         items += [i for i in got if i["id"] not in known]
-    if not counts.get(days[-1].strftime("%d-%b")):
-        raise RuntimeError("BSE returned no announcements for today: %s" % counts)
+    if not sum(counts.values()):
+        raise RuntimeError("BSE returned no announcements at all: %s" % counts)
     return items, counts
 
 
@@ -289,6 +320,40 @@ def fetch_nse(seen, start, today):
                     "pdfs": [att] if att.lower().endswith(".pdf") else [],
                     "page": "",
                 })
+    return items, listed
+
+
+def fetch_nse_sast(seen, start, today):
+    """NSE keeps Regulation 29 (SAST) disclosures in their own list, with the
+    acquirer's name as data, so names are matched without opening a document."""
+    from nse import NSE
+    items, listed = [], 0
+    with NSE(download_folder=tempfile.mkdtemp()) as api:
+        data = api._transport.request(
+            api.base_url + "/corporate-sast-reg29",
+            params={"index": "equities",
+                    "from_date": start.strftime("%d-%m-%Y"),
+                    "to_date": today.strftime("%d-%m-%Y")}).json()
+    rows = data.get("data") if isinstance(data, dict) else data
+    for r in rows or []:
+        if not isinstance(r, dict):
+            continue
+        listed += 1
+        values = [str(v) for v in r.values() if v not in (None, "")]
+        sid = short_id("S", "|".join(sorted(values)))
+        if sid in seen:
+            continue
+        pdfs = [v for v in values if v.lower().startswith("http") and ".pdf" in v.lower()]
+        items.append({
+            "id": sid, "exch": "NSE",
+            "company": str(r.get("company") or r.get("sm_name") or r.get("symbol") or ""),
+            "code": str(r.get("symbol") or ""),
+            "subject": "Regulation 29 (SAST) disclosure",
+            "summary": " | ".join(v for v in values if not v.lower().startswith("http"))[:900],
+            "category": "SAST",
+            "time": str(r.get("timestamp") or r.get("date") or r.get("acquirerDate") or ""),
+            "pdfs": pdfs[:1], "page": "", "row": True,
+        })
     return items, listed
 
 
@@ -365,45 +430,58 @@ def filed_on(item):
     return datetime.now(IST).strftime("%Y-%m-%d")
 
 
-def already_alerted(state, group, item, has_hit):
-    """Stops the same filing being emailed twice when it is on both exchanges."""
-    raw = "|".join([EMAIL_PASS or "x", group, norm(item["company"]), filed_on(item)])
+def already_alerted(state, group, item, hits):
+    """Stops the same match being emailed twice (both exchanges, or repeat filings)."""
+    names = ",".join(sorted(h[0] for h in hits))
+    raw = "|".join([EMAIL_PASS or "x", group, norm(item["company"]), filed_on(item), names])
     key = hashlib.sha1(raw.encode()).hexdigest()[:14]
-    prev = state["alerted"].get(key)
-    flag = item["exch"][0] + ("m" if has_hit else "n")
-    if prev and prev[0] != flag[0] and (prev[1] == "m" or not has_hit):
+    if key in state["alerted"]:
         return True
-    state["alerted"][key] = flag
+    state["alerted"][key] = item["exch"][0]
     state["alerted_on"][key] = datetime.now(IST).strftime("%Y-%m-%d")
     return False
 
 
-def handle(job, state, mailer, deadline):
+def match_label(hits):
+    sure = any(h[1] == "exact" for h in hits)
+    return ("MATCH" if sure else "POSSIBLE MATCH") + ": " + ", ".join(h[0] for h in hits)
+
+
+def link_of(item):
+    return (item["pdfs"] or [item["page"]])[0]
+
+
+def handle(job, state, mailer, deadline, run):
     """Returns True if a document was opened."""
     item, kind = job["item"], job["kind"]
-    day = state["day"]
     meta = " ".join([item["subject"], item["summary"], item["category"]])
+
+    if kind == "sast" and item.get("row"):
+        # NSE's SAST list: the names are in the data itself
+        run["sast_checked"] += 1
+        hits = match_names(SAST_NAMES, norm(meta))
+        if (hits or SAST_ALERT_ALL) and not already_alerted(state, "sast", item, hits):
+            mailer.send("SAST %s - %s" % (match_label(hits), item["company"]) if hits
+                        else "SAST filing: %s" % item["company"],
+                        (hit_lines(hits) + "\n\n" if hits else "") + describe(item))
+            run["sast_match"] += bool(hits)
+        return False
+
     # board-meeting documents are numerous, so only their first pages get OCR
     text, readable = read_document(item, deadline, 2 if kind == "pref_deep" else 10)
+    run["opened" if readable else "unopened"] += 1
     everything = norm(meta + " " + text)
 
     if kind == "sast":
+        run["sast_checked"] += 1
         hits = match_names(SAST_NAMES, everything)
-        if hits or SAST_ALERT_ALL:
-            if not already_alerted(state, "sast", item, bool(hits)):
-                who = ", ".join(h[0] for h in hits)
-                subject = ("SAST MATCH: %s - %s" % (who, item["company"]) if hits
-                           else "SAST filing: %s" % item["company"])
-                body = describe(item)
-                if hits:
-                    body = hit_lines(hits) + "\n\n" + body
-                elif not readable:
-                    body += "\n\nDocument could not be read - names not checked."
-                mailer.send(subject, body)
-                day["sast"] += 1
-        elif not readable and SAST_NAMES:
-            day["unread_sast"].append(
-                [item["company"], (item["pdfs"] or [item["page"]])[0]])
+        if (hits or SAST_ALERT_ALL) and not already_alerted(state, "sast", item, hits):
+            mailer.send("SAST %s - %s" % (match_label(hits), item["company"]) if hits
+                        else "SAST filing: %s" % item["company"],
+                        (hit_lines(hits) + "\n\n" if hits else "") + describe(item))
+            run["sast_match"] += bool(hits)
+        if not hits and not readable:
+            run["unread_sast"].append([item["company"], link_of(item)])
         return True
 
     note = ""
@@ -415,26 +493,20 @@ def handle(job, state, mailer, deadline):
         note = ("The subject line does not say 'preferential' - it was found inside "
                 "the document, so this may be a passing reference:\n   ..."
                 + snippet + "...\n\n")
+    run["pref_found"] += 1
 
     hits = match_names(ALLOTTEE_NAMES, everything)
-    if already_alerted(state, "pref", item, bool(hits)):
+    if not hits and not readable:
+        run["unread_pref"].append([item["company"], link_of(item)])
+    if not (hits or PREF_ALERT_ALL) or already_alerted(state, "pref", item, hits):
         return True
     if hits:
-        status = "MATCH: " + ", ".join(h[0] for h in hits)
-        top = hit_lines(hits) + "\n\n"
-    elif not readable:
-        status = "names not readable - check PDF"
-        top = ("The document could not be read automatically (scanned or missing), "
-               "so allottee names were NOT checked. Open it and check manually.\n\n")
-    elif ALLOTTEE_NAMES:
-        status = "no watchlist name"
-        top = "None of your %d watchlist names appear in the document.\n\n" % len(ALLOTTEE_NAMES)
+        mailer.send("PREF %s - %s" % (match_label(hits), item["company"]),
+                    hit_lines(hits) + "\n\n" + note + describe(item))
+        run["pref_match"] += 1
     else:
-        status = "no watchlist set"
-        top = ""
-    mailer.send("PREF ISSUE: %s (%s)" % (item["company"], status),
-                top + note + describe(item))
-    day["pref"] += 1
+        mailer.send("PREF ISSUE: %s (no watchlist name)" % item["company"],
+                    note + describe(item))
     return True
 
 
@@ -452,11 +524,6 @@ def classify(item):
 
 
 # --- state -------------------------------------------------------------------
-def fresh_day(date_str):
-    return {"date": date_str, "scanned": 0, "pref": 0, "sast": 0,
-            "unread_sast": [], "nse_ok": 0, "nse_fail": 0, "summary_sent": False}
-
-
 def load_state():
     state = {}
     try:
@@ -471,37 +538,44 @@ def load_state():
     return state
 
 
-def send_summary(day, mailer, as_of):
-    nse_total = day["nse_ok"] + day["nse_fail"]
-    if nse_total and not day["nse_fail"] and not day.get("new_NSE"):
-        nse = "connected but returned no filings - treat coverage as BSE only"
-    elif not nse_total or day["nse_fail"] == nse_total:
-        nse = "NOT reachable today - coverage was BSE only"
-    elif day["nse_fail"]:
-        nse = "reachable on %d of %d checks" % (day["nse_ok"], nse_total)
-    else:
-        nse = "OK"
+def send_summary(run, mailer, when):
+    def feed(status, counts):
+        if status == "OK":
+            return "OK - %s" % ", ".join("%s: %d" % kv for kv in counts.items())
+        return status
+    matches = run["pref_match"] + run["sast_match"]
     lines = [
-        "Scanner is running. Summary for %s%s:" % (day["date"], as_of),
+        "Scanner run of %s IST." % when.strftime("%d %b %Y, %H:%M"),
         "",
-        "Announcements scanned : %d (BSE %d, NSE %d)" % (
-            day["scanned"], day.get("new_BSE", 0), day.get("new_NSE", 0)),
-        "Preferential alerts   : %d" % day["pref"],
-        "SAST alerts           : %d" % day["sast"],
-        "BSE feed              : %s" % (
-            "OK" if day.get("bse", "OK") == "OK" else
-            "FAILED - BSE filings were NOT checked in this run. The next run "
-            "catches up automatically; you can also press Run workflow now."),
-        "NSE feed              : %s" % nse,
+        "Name matches emailed  : %d (preferential %d, SAST %d)" % (
+            matches, run["pref_match"], run["sast_match"]),
+        "New filings checked   : BSE %d, NSE %d" % (run["new_BSE"], run["new_NSE"]),
+        "Preferential filings  : %d found and checked against your %d names" % (
+            run["pref_found"], len(ALLOTTEE_NAMES)),
+        "SAST filings          : %d checked against your %d names" % (
+            run["sast_checked"], len(SAST_NAMES)),
+        "Documents             : %d read, %d could not be read" % (
+            run["opened"], run["unopened"]),
+        "",
+        "BSE feed              : %s" % feed(run["bse"], run["bse_counts"]),
+        "NSE feed              : %s" % feed(run["nse"], run["nse_counts"]),
+        "NSE SAST list         : %s" % run["nse_sast"],
     ]
-    unread = day["unread_sast"]
-    if unread:
-        lines += ["", "SAST filings that could not be read automatically (%d) - "
-                      "names were not checked, open these yourself:" % len(unread)]
-        lines += ["  %s  %s" % (c, u) for c, u in unread[:150]]
-    flag = "" if day.get("bse", "OK") == "OK" else "BSE FAILED - "
-    mailer.send("%sScanner daily summary %s: %d pref, %d SAST" %
-                (flag, day["date"], day["pref"], day["sast"]), "\n".join(lines))
+    if run["bse"] != "OK":
+        lines += ["", "BSE filings were NOT checked in this run. The next run catches "
+                      "up automatically; you can also press Run workflow now."]
+    if run["left"]:
+        lines += ["", "%d documents were left for the next run (time limit)." % run["left"]]
+    for title, rows in (("Preferential issue filings", run["unread_pref"]),
+                        ("SAST filings", run["unread_sast"])):
+        if rows:
+            lines += ["", "%s whose document could not be read (%d) - names were NOT "
+                          "checked, open these yourself:" % (title, len(rows))]
+            lines += ["  %s  %s" % (c, u) for c, u in rows[:150]]
+    flag = "" if run["bse"] == "OK" else "BSE FAILED - "
+    mailer.send("%sScanner summary %s: %d name match%s" % (
+        flag, when.strftime("%d %b"), matches, "" if matches == 1 else "es"),
+        "\n".join(lines))
 
 
 # --- main --------------------------------------------------------------------
@@ -529,57 +603,65 @@ def main():
     mailer = Mailer()
     failed = False
 
-    # yesterday's summary if it never went out, then start a new day
-    day = state.get("day") or fresh_day(today_str)
-    if day["date"] != today_str:
-        if not day["summary_sent"] and day["scanned"]:
-            try:
-                send_summary(day, mailer, "")
-            except Exception as exc:
-                print("summary email failed:", type(exc).__name__)
-        day = fresh_day(today_str)
-    state["day"] = day
+    run = {"new_BSE": 0, "new_NSE": 0, "pref_found": 0, "pref_match": 0,
+           "sast_checked": 0, "sast_match": 0, "opened": 0, "unopened": 0,
+           "unread_pref": [], "unread_sast": [], "left": 0,
+           "bse": "not run", "nse": "not run", "nse_sast": "not run",
+           "bse_counts": {}, "nse_counts": {}}
+    state.pop("day", None)
 
     # 1. fetch
     items = []
-    listed = {"BSE": 0, "NSE": 0}
     fixture = os.environ.get("SCANNER_FIXTURE")
     if fixture:
         with open(fixture) as fh:
             items = [i for i in json.load(fh) if i["id"] not in state["seen"]]
+        run["bse"] = run["nse"] = "OK"
     else:
         try:
             days = catch_up_days(state.get("bse_ok"), today, first_run)
-            got, listed["BSE"] = fetch_bse(state["seen"], days)
+            got, run["bse_counts"] = fetch_bse(state["seen"], days)
             items += got
             state["bse_ok"] = today_str
-            day["bse"] = "OK"
+            run["bse"] = "OK"
         except Exception as exc:
             failed = True
-            day["bse"] = "FAILED"
+            run["bse"] = "FAILED"
             print("BSE fetch failed:", type(exc).__name__, str(exc)[:200])
+        days = catch_up_days(state.get("nse_ok"), today, first_run)
         try:
-            days = catch_up_days(state.get("nse_ok"), today, first_run)
-            got, listed["NSE"] = fetch_nse(state["seen"], days[0], today)
+            got, run["nse_counts"] = fetch_nse(state["seen"], days[0], today)
             items += got
-            day["nse_ok"] += 1
-            if sum(listed["NSE"].values()):
+            if sum(run["nse_counts"].values()):
                 state["nse_ok"] = today_str
+                run["nse"] = "OK"
+            else:
+                run["nse"] = "connected but returned no filings - coverage was BSE only"
         except Exception as exc:
-            day["nse_fail"] += 1
+            run["nse"] = "NOT reachable - coverage was BSE only"
             print("NSE not reachable this run:", type(exc).__name__)
-    day["scanned"] += len(items)
+        if SAST_NAMES or SAST_ALERT_ALL:
+            try:
+                got, n = fetch_nse_sast(state["seen"], days[0], today)
+                items += got
+                run["nse_sast"] = "OK - %d listed" % n
+            except Exception as exc:
+                run["nse_sast"] = "not available (%s)" % type(exc).__name__
+                print("NSE SAST list not available:", type(exc).__name__, str(exc)[:150])
+        else:
+            run["nse_sast"] = "skipped (no SAST names set)"
     for exch in ("BSE", "NSE"):
-        day["new_" + exch] = day.get("new_" + exch, 0) + sum(
-            1 for i in items if i["exch"] == exch)
+        run["new_" + exch] = sum(1 for i in items if i["exch"] == exch)
     print("Filings listed by each feed for the dates checked (including ones seen "
-          "before) - BSE: %s | NSE: %s" % (listed["BSE"] or "nothing", listed["NSE"] or "nothing"))
+          "before) - BSE: %s | NSE: %s | NSE SAST list: %s" % (
+              run["bse_counts"] or run["bse"], run["nse_counts"] or run["nse"],
+              run["nse_sast"]))
 
     # 2. queue the interesting ones
     jobs = state["pending"]
     for item in items:
         state["seen"][item["id"]] = today_str
-        for kind in classify(item):
+        for kind in (["sast"] if item.get("row") else classify(item)):
             jobs.append({"item": item, "kind": kind, "queued": today_str})
     order = {"pref_meta": 0, "sast": 1, "pref_deep": 2}
     jobs.sort(key=lambda j: order.get(j["kind"], 9))
@@ -591,7 +673,7 @@ def main():
             remaining = jobs[idx:]
             break
         try:
-            if handle(job, state, mailer, deadline):
+            if handle(job, state, mailer, deadline, run):
                 opened += 1
         except Exception as exc:
             # most likely the email failed - keep the job and try again next run
@@ -602,13 +684,14 @@ def main():
     cutoff = (today - timedelta(days=3)).strftime("%Y-%m-%d")
     state["pending"] = [j for j in remaining if j.get("queued", today_str) >= cutoff]
 
-    # 4. daily summary
-    if now.hour >= SUMMARY_HOUR and not day["summary_sent"]:
-        try:
-            send_summary(day, mailer, " (as of %s IST)" % now.strftime("%H:%M"))
-            day["summary_sent"] = True
-        except Exception as exc:
-            print("summary email failed:", type(exc).__name__)
+    run["left"] = len(state["pending"])
+
+    # 4. summary of this run
+    try:
+        send_summary(run, mailer, now)
+    except Exception as exc:
+        failed = True
+        print("summary email failed:", type(exc).__name__)
 
     # 5. tidy up and save
     keep = (today - timedelta(days=7)).strftime("%Y-%m-%d")
@@ -619,9 +702,11 @@ def main():
     with open(STATE_FILE, "w") as fh:
         json.dump(state, fh, separators=(",", ":"))
     mailer.close()
-    print("new announcements: %d | documents opened: %d | queued for next run: %d | "
-          "emails sent: %d | %.0fs" % (len(items), opened, len(state["pending"]),
-                                       mailer.sent, time.time() - started))
+    print("new filings: %d | documents read: %d, unreadable: %d | name matches: %d | "
+          "left for next run: %d | emails sent: %d | %.0fs" % (
+              len(items), run["opened"], run["unopened"],
+              run["pref_match"] + run["sast_match"], len(state["pending"]),
+              mailer.sent, time.time() - started))
     return 1 if failed else 0
 
 
