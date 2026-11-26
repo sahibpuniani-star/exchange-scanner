@@ -618,10 +618,36 @@ def bse_api_deals(session, url, force_kind=None):
     return None, reason
 
 
+def bse_try_all(session, label, found, notes):
+    for kind, url in BSE_DEAL_APIS:
+        if kind in found:
+            continue
+        got, reason = bse_api_deals(session, url, kind)
+        if got is not None:
+            found[kind] = got
+        else:
+            notes.append(label + reason)
+    if "bulk" not in found:
+        for url in BSE_DEAL_APIS_OLD:
+            got, reason = bse_api_deals(session, url)
+            if got is not None:
+                found["bulk"] = got
+                break
+            notes.append(label + reason)
+
+
 def fetch_bse_deals():
-    """BSE's website loads deals from its data service; older addresses and the old
-    report pages are fallbacks. Returns (deals, note, {kind: error})."""
-    deals, errors, notes = [], {}, []
+    """BSE's website loads deals from its data service. Asked first exactly the way the
+    announcements check asks BSE (which BSE accepts), then as a browser would; the old
+    report pages are the last resort. Returns (deals, note, {kind: error})."""
+    deals, errors, notes, found = [], {}, [], {}
+    # 1. the same session and settings as the working announcements check, no home page
+    try:
+        from bse import BSE
+        with BSE(download_folder=tempfile.mkdtemp()) as api:
+            bse_try_all(api.session, "direct: ", found, notes)
+    except Exception as exc:
+        notes.append("BSE library session: %s" % type(exc).__name__)
     with requests.Session() as session:
         session.headers.update({
             "User-Agent": UA, "Referer": "https://www.bseindia.com/",
@@ -629,24 +655,13 @@ def fetch_bse_deals():
             "Accept": "application/json, text/plain, */*",
             "Accept-Language": "en-US,en;q=0.9",
             "Sec-Fetch-Site": "same-site"})
-        try:
-            session.get("https://www.bseindia.com/", timeout=30)
-        except Exception as exc:
-            print("BSE home page not reachable:", type(exc).__name__)
-        found = {}
-        for kind, url in BSE_DEAL_APIS:
-            got, reason = bse_api_deals(session, url, kind)
-            if got is not None:
-                found[kind] = got
-            else:
-                notes.append(reason)
-        if "bulk" not in found:
-            for url in BSE_DEAL_APIS_OLD:
-                got, reason = bse_api_deals(session, url)
-                if got is not None:
-                    found["bulk"] = got
-                    break
-                notes.append(reason)
+        # 2. as a browser would: home page first for cookies
+        if "bulk" not in found or "block" not in found:
+            try:
+                session.get("https://www.bseindia.com/", timeout=30)
+            except Exception as exc:
+                print("BSE home page not reachable:", type(exc).__name__)
+            bse_try_all(session, "after home page: ", found, notes)
         if notes:
             print("BSE data service:", " | ".join(n for n in notes if n)[:900])
         if "bulk" in found:
