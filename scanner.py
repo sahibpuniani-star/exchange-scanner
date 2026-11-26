@@ -524,19 +524,106 @@ def parse_bse_deals(html, kind):
     return deals, as_on.group(1) if as_on else ""
 
 
+BSE_DEAL_APIS = (
+    "https://api.bseindia.com/BseIndiaAPI/api/BulkBlockDeal/w",
+    "https://api.bseindia.com/BseIndiaAPI/api/BulkDeals/w",
+)
+
+
+def json_records(data, label=""):
+    """Every list of records in a JSON answer, with the key it sat under."""
+    if isinstance(data, list):
+        if data and all(isinstance(x, dict) for x in data):
+            yield label, data
+        return
+    if isinstance(data, dict):
+        for k, v in data.items():
+            yield from json_records(v, str(k))
+
+
+def pick(rec, *patterns, avoid=None):
+    for pat in patterns:
+        for k, v in rec.items():
+            kl = k.lower()
+            if re.search(pat, kl) and not (avoid and re.search(avoid, kl)) and v not in (None, ""):
+                return str(v).strip()
+    return ""
+
+
+def deals_from_json(data):
+    """Reads deals from a BSE JSON answer without relying on exact field names."""
+    deals = []
+    for label, recs in json_records(data):
+        kind_of_list = "block" if "block" in label.lower() else "bulk"
+        for rec in recs:
+            client = pick(rec, r"client", r"party", r"buyer|seller")
+            if not client:
+                continue
+            kind = pick(rec, r"^deal_?cat|segment|bulk.?block|^type$").lower()
+            d = {"exch": "BSE",
+                 "kind": "block" if "block" in kind else ("bulk" if "bulk" in kind else kind_of_list),
+                 "date": pick(rec, r"deal.?d(a)?te?$", r"date", r"_dt$|^dt"),
+                 "code": pick(rec, r"scrip.?c(o)?de?$", r"security.?code", r"scrip_?cd"),
+                 "company": pick(rec, r"scrip.?name|security.?name|company|long.?name",
+                                 r"short.?name|scrip_?nm|symbol"),
+                 "client": client,
+                 "side": pick(rec, r"deal.?type|buy.?sell|transaction|b_?s$|^flag$", avoid=r"cat"),
+                 "qty": pick(rec, r"qty|quantity"),
+                 "price": pick(rec, r"price|rate|watp|value")}
+            d["side"] = {"B": "BUY", "S": "SELL", "P": "BUY"}.get(d["side"].upper(), d["side"])
+            d["id"] = deal_id(d)
+            deals.append(d)
+    return deals
+
+
+def json_shape(data):
+    """Field names only, for the log."""
+    parts = []
+    for label, recs in json_records(data):
+        parts.append("%s[%d]: %s" % (label or "list", len(recs), ", ".join(list(recs[0])[:14])))
+    if not parts and isinstance(data, dict):
+        parts.append("keys: " + ", ".join(list(data)[:14]))
+    return "; ".join(parts)[:400] or type(data).__name__
+
+
 def fetch_bse_deals():
-    """Opens BSE's home page first for cookies, as a browser would, then reads the
-    bulk and block deal pages. Returns (deals, as-on date, {kind: error})."""
+    """BSE's new website loads deals from its data service; the old report pages are
+    kept as a fallback. Returns (deals, as-on date, {kind: error})."""
     deals, errors, as_on = [], {}, ""
     with requests.Session() as session:
         session.headers.update({
             "User-Agent": UA, "Referer": "https://www.bseindia.com/",
-            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+            "Origin": "https://www.bseindia.com",
+            "Accept": "application/json, text/plain, */*",
             "Accept-Language": "en-US,en;q=0.9"})
         try:
             session.get("https://www.bseindia.com/", timeout=30)
         except Exception as exc:
             print("BSE home page not reachable:", type(exc).__name__)
+        notes = []
+        for url in BSE_DEAL_APIS:
+            try:
+                r = session.get(url, timeout=40)
+                if r.status_code != 200:
+                    notes.append("%s answered %d" % (url.split("/")[-2], r.status_code))
+                    continue
+                try:
+                    data = r.json()
+                except ValueError:
+                    notes.append("%s sent no JSON (%s)" % (url.split("/")[-2], page_hint(r.text)))
+                    continue
+                got = deals_from_json(data)
+                print("BSE %s: %d deals - %s" % (url.split("/")[-2], len(got), json_shape(data)))
+                if got:
+                    return got, "", {}
+                notes.append("%s had no client names (%s)" % (url.split("/")[-2], json_shape(data)))
+            except Exception as exc:
+                notes.append("%s: %s" % (url.split("/")[-2], type(exc).__name__))
+        if notes:
+            print("BSE data service:", " | ".join(notes)[:900])
+        # fallback: the old report pages
+        session.headers["Accept"] = "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8"
+        session.headers.pop("Origin", None)
         for kind, urls in BSE_DEAL_PAGES:
             last = None
             for attempt in range(2):
