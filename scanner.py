@@ -781,9 +781,18 @@ def scan_bulk_deals(state, mailer, run, today, today_str, first_run):
         run["bulk_nse"] = "FAILED (%s) - the next run catches up" % type(exc).__name__
         print("NSE bulk/block deals failed:", type(exc).__name__, str(exc)[:200])
 
-    new = [d for d in deals if d["id"] not in state["seen"]]
-    found = [(h, d) for d in new for h in match_deal(BULK_NAMES, d["client"])]
-    run["bulk_checked"] = len(new)
+    # Every deal fetched is checked on every run (a few hundred at most), so names
+    # added to the list are also checked against deals seen before. A deal is emailed
+    # once per watch name.
+    found, keys = [], []
+    for d in deals:
+        for h in match_deal(BULK_NAMES, d["client"]):
+            key = short_id("A", d["id"] + "|" + norm(h[0]))
+            if key in state["alerted"] or key in keys:
+                continue
+            found.append((h, d))
+            keys.append(key)
+    run["bulk_checked"] = len(deals)
     if found:
         names = []
         for h, _ in found:
@@ -806,9 +815,10 @@ def scan_bulk_deals(state, mailer, run, today, today_str, first_run):
             subject += " (%d deals)" % len(found)
         mailer.send(subject, "\n".join(lines))
         run["bulk_match"] = len(found)
-    # marked as seen only once any alert has gone out
-    for d in new:
-        state["seen"][d["id"]] = today_str
+    # remembered only once the alert has gone out
+    for key in keys:
+        state["alerted"][key] = "D"
+        state["alerted_on"][key] = today_str
 
 
 # --- email -------------------------------------------------------------------
@@ -1015,7 +1025,7 @@ def send_summary(run, mailer, when):
         "NSE feed              : %s" % feed(run["nse"], run["nse_counts"]),
         "NSE SAST list         : %s" % run["nse_sast"],
         "",
-        "Bulk + block deals    : %d new deals checked against your %d names" % (
+        "Bulk + block deals    : %d deals checked against your %d names" % (
             run["bulk_checked"], len(BULK_NAMES)),
         "BSE bulk/block deals  : %s" % run["bulk_bse"],
         "NSE bulk/block deals  : %s" % run["bulk_nse"],
