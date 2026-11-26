@@ -200,12 +200,15 @@ def match_deal(names, client):
     if not c:
         return []
     c_huf = "huf" in norm(client).split()
-    hits = []
+    hits, done = [], set()
     for name in names:
         w = name_tokens(name)
-        if not w:
+        is_huf = "huf" in norm(name).split()
+        # the same name written in another word order counts once
+        if not w or (tuple(sorted(w)), is_huf) in done:
             continue
-        same_huf = ("huf" in norm(name).split()) == c_huf
+        done.add((tuple(sorted(w)), is_huf))
+        same_huf = is_huf == c_huf
         if sorted(w) == sorted(c):
             hits.append((name, "exact" if same_huf else "possible", client))
             continue
