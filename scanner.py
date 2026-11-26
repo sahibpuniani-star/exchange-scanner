@@ -8,6 +8,8 @@ Runs once a night. Every run it:
   2. opens preferential issue and board meeting documents and emails you only
      when a name on your allottee watchlist appears,
   3. does the same for SAST / takeover disclosures and your SAST watchlist,
+  3b. reads the day's BSE and NSE bulk deals and emails you when a client name
+      matches your bulk deal watchlist,
   4. sends one summary email at the end, so you know it ran and what it covered.
 
 All settings come from environment variables (GitHub Secrets) - see SETUP.md.
@@ -21,6 +23,7 @@ import smtplib
 import sys
 import tempfile
 import time
+from html.parser import HTMLParser
 from datetime import datetime, timedelta, timezone
 from email.message import EmailMessage
 
@@ -61,6 +64,8 @@ def name_list(var):
 
 ALLOTTEE_NAMES = name_list("ALLOTTEE_NAMES")
 SAST_NAMES = name_list("SAST_NAMES")
+# bulk deals: their own list if set, otherwise the allottee list
+BULK_NAMES = name_list("BULK_NAMES") or ALLOTTEE_NAMES
 SAST_ALERT_ALL = os.environ.get("SAST_ALERT_ALL") == "1"
 PREF_ALERT_ALL = os.environ.get("PREF_ALERT_ALL") == "1"
 EMAIL_USER = os.environ.get("EMAIL_USER", "")
@@ -148,6 +153,75 @@ def near_match(toks, words, p):
         if len(extra) <= 1 and all(w.isalpha() and w not in BREAK for w in extra):
             return True
     return False
+
+
+# --- matching a bulk deal's client name ---------------------------------------
+def name_tokens(text):
+    return [t for t in norm(text).split() if t not in FILLER]
+
+
+def tok_eq(a, b):
+    """Same word, or an initial that fits the other word ("g" and "gandhi")."""
+    if a == b:
+        return True
+    if len(a) == 1 and len(b) > 1:
+        return b.startswith(a)
+    if len(b) == 1 and len(a) > 1:
+        return a.startswith(b)
+    return False
+
+
+def cover(small, big):
+    """Pairs every word of `small` with a different word of `big`.
+    Returns (whole-word pairs, positions used in big); -1 if a word has no partner."""
+    used, whole = set(), 0
+    for i in sorted(range(len(small)), key=lambda i: len(small[i]) == 1):
+        a, best = small[i], None
+        for j, b in enumerate(big):
+            if j in used:
+                continue
+            if a == b:
+                best = j
+                break
+            if best is None and tok_eq(a, b):
+                best = j
+        if best is None:
+            return -1, used
+        used.add(best)
+        whole += a == big[best] and len(a) > 1
+    return whole, used
+
+
+def match_deal(names, client):
+    """A bulk deal lists one client per row, so a name may match in any word order,
+    with a middle name missing on either side, or with an initial for a word:
+    "Khushboo Siddharth Nahar" matches "NAHAR KHUSHBOO" and "NAHAR SIDDHARTH KHUSHBOO"."""
+    c = name_tokens(client)
+    if not c:
+        return []
+    c_huf = "huf" in norm(client).split()
+    hits = []
+    for name in names:
+        w = name_tokens(name)
+        if not w:
+            continue
+        same_huf = ("huf" in norm(name).split()) == c_huf
+        if sorted(w) == sorted(c):
+            hits.append((name, "exact" if same_huf else "possible", client))
+            continue
+        if len(w) < 2:
+            continue
+        need = min(2, sum(1 for t in w if len(t) > 1))
+        # the deal leaves a word out: it must still have the first and last word
+        whole, used = cover(c, w)
+        if len(c) >= 2 and whole >= need and 0 in used and len(w) - 1 in used:
+            hits.append((name, "possible", client))
+            continue
+        # the deal adds a word (a middle name, "HUF", "Enterprises")
+        whole, used = cover(w, c)
+        if whole >= need:
+            hits.append((name, "possible", client))
+    return hits
 
 
 # --- reading documents -------------------------------------------------------
@@ -381,6 +455,180 @@ def fetch_nse_sast(seen, start, today):
     return items, listed
 
 
+# --- bulk deals ----------------------------------------------------------------
+BSE_BULK_URL = "https://www.bseindia.com/markets/equity/EQReports/bulk_deals.aspx?expandable=3"
+
+
+class TableRows(HTMLParser):
+    """Collects the text of every table row on a page."""
+
+    def __init__(self):
+        super().__init__()
+        self.rows, self.row, self.cell = [], None, None
+
+    def handle_starttag(self, tag, attrs):
+        if tag == "tr":
+            self.row = []
+        elif tag in ("td", "th") and self.row is not None:
+            self.cell = []
+
+    def handle_endtag(self, tag):
+        if tag in ("td", "th") and self.cell is not None and self.row is not None:
+            self.row.append(" ".join("".join(self.cell).split()))
+            self.cell = None
+        elif tag == "tr" and self.row is not None:
+            self.rows.append(self.row)
+            self.row = None
+
+    def handle_data(self, data):
+        if self.cell is not None:
+            self.cell.append(data)
+
+
+def deal_id(d):
+    return short_id("D", "|".join(str(d.get(k, "")) for k in
+                                  ("exch", "kind", "date", "code", "client", "side", "qty", "price")))
+
+
+def parse_bse_bulk(html):
+    """BSE's bulk deals page lists the latest trading day's deals as a table:
+    Deal Date | Security Code | Security Name | Client Name | Deal Type | Quantity | Price."""
+    parser = TableRows()
+    parser.feed(html)
+    if not any("Client Name" in " ".join(r) for r in parser.rows):
+        raise RuntimeError("no bulk deals table on the BSE page - layout changed or blocked")
+    deals = []
+    for r in parser.rows:
+        if len(r) >= 7 and re.match(r"\d{2}/\d{2}/\d{4}$", r[0]):
+            d = {"exch": "BSE", "kind": "bulk", "date": r[0], "code": r[1], "company": r[2],
+                 "client": r[3], "side": {"B": "BUY", "S": "SELL"}.get(r[4], r[4]),
+                 "qty": r[5], "price": r[6]}
+            d["id"] = deal_id(d)
+            deals.append(d)
+    as_on = re.search(r"As on\s*(\d{1,2}\s+\w{3}\s+\d{2,4})", html)
+    return deals, as_on.group(1) if as_on else ""
+
+
+def fetch_bse_bulk():
+    last = None
+    for attempt in range(3):
+        try:
+            r = requests.get(BSE_BULK_URL, timeout=40, headers={
+                "User-Agent": UA, "Referer": "https://www.bseindia.com/",
+                "Accept": "text/html,application/xhtml+xml"})
+            if r.status_code != 200:
+                raise RuntimeError("BSE answered %d" % r.status_code)
+            return parse_bse_bulk(r.text)
+        except Exception as exc:
+            last = exc
+            time.sleep(10)
+    raise last
+
+
+def fetch_nse_deals(start, today):
+    """NSE bulk and block deals for the dates. Returns (deals, {kind: error})."""
+    deals, errors = [], {}
+    with nse_open() as api:
+        for option, kind in (("bulk_deals", "bulk"), ("block_deals", "block")):
+            try:
+                rows = api.bulk_deals(option, from_date=start, to_date=today)
+            except RuntimeError as exc:
+                if not str(exc).startswith("No "):   # "No ... data available" = none that day
+                    errors[kind] = exc
+                    continue
+                rows = []
+            except Exception as exc:
+                errors[kind] = exc
+                continue
+            for r in rows or []:
+                d = {"exch": "NSE", "kind": kind, "date": str(r.get("BD_DT_DATE") or ""),
+                     "code": str(r.get("BD_SYMBOL") or ""),
+                     "company": str(r.get("BD_SCRIP_NAME") or r.get("BD_SYMBOL") or ""),
+                     "client": str(r.get("BD_CLIENT_NAME") or ""),
+                     "side": str(r.get("BD_BUY_SELL") or ""),
+                     "qty": r.get("BD_QTY_TRD") or "", "price": r.get("BD_TP_WATP") or ""}
+                d["id"] = deal_id(d)
+                deals.append(d)
+    return deals, errors
+
+
+def fmt_qty(q):
+    try:
+        n = int(float(str(q).replace(",", "")))
+    except ValueError:
+        return str(q)
+    # Indian grouping: 12,34,567
+    s, head = str(n), ""
+    if len(s) > 3:
+        head, s = s[:-3], s[-3:]
+        while len(head) > 2:
+            s = head[-2:] + "," + s
+            head = head[:-2]
+        s = head + "," + s
+    return s
+
+
+def scan_bulk_deals(state, mailer, run, today, today_str, first_run):
+    deals = []
+    try:
+        got, as_on = fetch_bse_bulk()
+        deals += got
+        run["bulk_bse"] = "OK - %d deals%s" % (len(got), " (as on %s)" % as_on if as_on else "")
+    except Exception as exc:
+        run["bulk_bse"] = "FAILED (%s) - today's BSE bulk deals were NOT checked" % type(exc).__name__
+        print("BSE bulk deals failed:", type(exc).__name__, str(exc)[:200])
+    days = catch_up_days(state.get("bulk_nse_ok"), today, first_run)
+    try:
+        got, errors = fetch_nse_deals(days[0], today)
+        deals += got
+        counts = "%d bulk, %d block deals from %s to %s" % (
+            sum(d["kind"] == "bulk" for d in got), sum(d["kind"] == "block" for d in got),
+            days[0].strftime("%d %b"), today.strftime("%d %b"))
+        for kind, exc in errors.items():
+            print("NSE %s deals failed:" % kind, type(exc).__name__, str(exc)[:200])
+        if not errors:
+            state["bulk_nse_ok"] = today_str
+            run["bulk_nse"] = "OK - " + counts
+        elif len(errors) == 2:
+            run["bulk_nse"] = "FAILED (%s) - the next run catches up" % type(
+                errors["bulk"]).__name__
+        else:
+            run["bulk_nse"] = "FAILED for %s deals (%s) - the next run catches up; %s" % (
+                ", ".join(errors), type(list(errors.values())[0]).__name__, counts)
+    except Exception as exc:
+        run["bulk_nse"] = "FAILED (%s) - the next run catches up" % type(exc).__name__
+        print("NSE bulk/block deals failed:", type(exc).__name__, str(exc)[:200])
+
+    new = [d for d in deals if d["id"] not in state["seen"]]
+    found = [(h, d) for d in new for h in match_deal(BULK_NAMES, d["client"])]
+    run["bulk_checked"] = len(new)
+    if found:
+        names = []
+        for h, _ in found:
+            if h[0] not in names:
+                names.append(h[0])
+        lines = []
+        for h, d in found:
+            label = "MATCH" if h[1] == "exact" else "POSSIBLE MATCH"
+            lines.append("%s: %s\n   listed as : %s\n   deal      : %s %s deal %s - %s (%s) - %s %s shares @ Rs %s\n" % (
+                label, h[0], d["client"], d["exch"], d.get("kind", "bulk"), d["date"],
+                d["company"], d["code"],
+                d["side"], fmt_qty(d["qty"]), d["price"]))
+        lines += ["BSE: " + BSE_BULK_URL,
+                  "NSE: https://www.nseindia.in/market-data/large-deals"]
+        sure = any(h[1] == "exact" for h, _ in found)
+        kinds = sorted({d.get("kind", "bulk") for _, d in found}, reverse=True)
+        subject = "%s DEAL %s: %s" % ("/".join(k.upper() for k in kinds),
+                                      "MATCH" if sure else "POSSIBLE MATCH", ", ".join(names))
+        if len(found) > 1:
+            subject += " (%d deals)" % len(found)
+        mailer.send(subject, "\n".join(lines))
+        run["bulk_match"] = len(found)
+    # marked as seen only once any alert has gone out
+    for d in new:
+        state["seen"][d["id"]] = today_str
+
+
 # --- email -------------------------------------------------------------------
 class Mailer:
     def __init__(self):
@@ -567,12 +815,12 @@ def send_summary(run, mailer, when):
         if status == "OK":
             return "OK - %s" % ", ".join("%s: %d" % kv for kv in counts.items())
         return status
-    matches = run["pref_match"] + run["sast_match"]
+    matches = run["pref_match"] + run["sast_match"] + run["bulk_match"]
     lines = [
         "Scanner run of %s IST." % when.strftime("%d %b %Y, %H:%M"),
         "",
-        "Name matches emailed  : %d (preferential %d, SAST %d)" % (
-            matches, run["pref_match"], run["sast_match"]),
+        "Name matches emailed  : %d (preferential %d, SAST %d, bulk/block deals %d)" % (
+            matches, run["pref_match"], run["sast_match"], run["bulk_match"]),
         "New filings checked   : BSE %d, NSE %d" % (run["new_BSE"], run["new_NSE"]),
         "Preferential filings  : %d found and checked against your %d names" % (
             run["pref_found"], len(ALLOTTEE_NAMES)),
@@ -584,6 +832,11 @@ def send_summary(run, mailer, when):
         "BSE feed              : %s" % feed(run["bse"], run["bse_counts"]),
         "NSE feed              : %s" % feed(run["nse"], run["nse_counts"]),
         "NSE SAST list         : %s" % run["nse_sast"],
+        "",
+        "Bulk + block deals    : %d new deals checked against your %d names" % (
+            run["bulk_checked"], len(BULK_NAMES)),
+        "BSE bulk deals        : %s" % run["bulk_bse"],
+        "NSE bulk/block deals  : %s" % run["bulk_nse"],
     ]
     if run["bse"] != "OK":
         lines += ["", "BSE filings were NOT checked in this run. The next run catches "
@@ -597,6 +850,8 @@ def send_summary(run, mailer, when):
                           "checked, open these yourself:" % (title, len(rows))]
             lines += ["  %s  %s" % (c, u) for c, u in rows[:150]]
     flag = "" if run["bse"] == "OK" else "BSE FAILED - "
+    if run["bulk_bse"].startswith("FAILED") or run["bulk_nse"].startswith("FAILED"):
+        flag += "BULK DEALS FAILED - "
     mailer.send("%sScanner summary %s: %d name match%s" % (
         flag, when.strftime("%d %b"), matches, "" if matches == 1 else "es"),
         "\n".join(lines))
@@ -631,7 +886,9 @@ def main():
            "sast_checked": 0, "sast_match": 0, "opened": 0, "unopened": 0,
            "unread_pref": [], "unread_sast": [], "left": 0,
            "bse": "not run", "nse": "not run", "nse_sast": "not run",
-           "bse_counts": {}, "nse_counts": {}}
+           "bse_counts": {}, "nse_counts": {},
+           "bulk_checked": 0, "bulk_match": 0,
+           "bulk_bse": "not run", "bulk_nse": "not run"}
     state.pop("day", None)
 
     # 1. fetch
@@ -683,6 +940,16 @@ def main():
               run["bse_counts"] or run["bse"], run["nse_counts"] or run["nse"],
               run["nse_sast"]))
 
+    # 1b. bulk deals (quick, so they go out before the long document work)
+    if BULK_NAMES and (not fixture or os.environ.get("BULK_TEST")):
+        try:
+            scan_bulk_deals(state, mailer, run, today, today_str, first_run)
+        except Exception as exc:
+            failed = True
+            print("bulk deal alert failed, will retry:", type(exc).__name__, str(exc)[:200])
+    elif not BULK_NAMES:
+        run["bulk_bse"] = run["bulk_nse"] = "skipped (no names set)"
+
     # 2. queue the interesting ones
     jobs = state["pending"]
     for item in items:
@@ -731,7 +998,7 @@ def main():
     print("new filings: %d | documents read: %d, unreadable: %d | name matches: %d | "
           "left for next run: %d | emails sent: %d | %.0fs" % (
               len(items), run["opened"], run["unopened"],
-              run["pref_match"] + run["sast_match"], len(state["pending"]),
+              run["pref_match"] + run["sast_match"] + run["bulk_match"], len(state["pending"]),
               mailer.sent, time.time() - started))
     return 1 if failed else 0
 
