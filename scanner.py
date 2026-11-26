@@ -456,7 +456,11 @@ def fetch_nse_sast(seen, start, today):
 
 
 # --- bulk deals ----------------------------------------------------------------
-BSE_BULK_URL = "https://www.bseindia.com/markets/equity/EQReports/bulk_deals.aspx?expandable=3"
+BSE_BULK_URL = "https://www.bseindia.com/markets/equity/EQReports/bulk_deals.aspx"
+BSE_DEAL_PAGES = (
+    ("bulk", [BSE_BULK_URL, BSE_BULK_URL + "?expandable=3"]),
+    ("block", ["https://www.bseindia.com/markets/equity/EQReports/block_deals.aspx"]),
+)
 
 
 class TableRows(HTMLParser):
@@ -490,39 +494,68 @@ def deal_id(d):
                                   ("exch", "kind", "date", "code", "client", "side", "qty", "price")))
 
 
-def parse_bse_bulk(html):
-    """BSE's bulk deals page lists the latest trading day's deals as a table:
+def page_hint(html):
+    """A short description of a page, for the log when it is not what we expected."""
+    title = re.search(r"<title[^>]*>(.*?)</title>", html or "", re.S | re.I)
+    text = " ".join(re.sub(r"<[^>]+>", " ", html or "").split())
+    return "title %r, %d bytes, text starts %r" % (
+        " ".join(title.group(1).split())[:80] if title else "", len(html or ""), text[:160])
+
+
+def parse_bse_deals(html, kind):
+    """BSE's bulk and block deal pages list the latest trading day as a table:
     Deal Date | Security Code | Security Name | Client Name | Deal Type | Quantity | Price."""
     parser = TableRows()
     parser.feed(html)
-    if not any("Client Name" in " ".join(r) for r in parser.rows):
-        raise RuntimeError("no bulk deals table on the BSE page - layout changed or blocked")
     deals = []
     for r in parser.rows:
         if len(r) >= 7 and re.match(r"\d{2}/\d{2}/\d{4}$", r[0]):
-            d = {"exch": "BSE", "kind": "bulk", "date": r[0], "code": r[1], "company": r[2],
+            d = {"exch": "BSE", "kind": kind, "date": r[0], "code": r[1], "company": r[2],
                  "client": r[3], "side": {"B": "BUY", "S": "SELL"}.get(r[4], r[4]),
                  "qty": r[5], "price": r[6]}
             d["id"] = deal_id(d)
             deals.append(d)
+    if not deals and not any("client" in " ".join(r).lower() for r in parser.rows):
+        raise RuntimeError("no deals table on the BSE %s page (%s)" % (kind, page_hint(html)))
     as_on = re.search(r"As on\s*(\d{1,2}\s+\w{3}\s+\d{2,4})", html)
     return deals, as_on.group(1) if as_on else ""
 
 
-def fetch_bse_bulk():
-    last = None
-    for attempt in range(3):
+def fetch_bse_deals():
+    """Opens BSE's home page first for cookies, as a browser would, then reads the
+    bulk and block deal pages. Returns (deals, as-on date, {kind: error})."""
+    deals, errors, as_on = [], {}, ""
+    with requests.Session() as session:
+        session.headers.update({
+            "User-Agent": UA, "Referer": "https://www.bseindia.com/",
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+            "Accept-Language": "en-US,en;q=0.9"})
         try:
-            r = requests.get(BSE_BULK_URL, timeout=40, headers={
-                "User-Agent": UA, "Referer": "https://www.bseindia.com/",
-                "Accept": "text/html,application/xhtml+xml"})
-            if r.status_code != 200:
-                raise RuntimeError("BSE answered %d" % r.status_code)
-            return parse_bse_bulk(r.text)
+            session.get("https://www.bseindia.com/", timeout=30)
         except Exception as exc:
-            last = exc
-            time.sleep(10)
-    raise last
+            print("BSE home page not reachable:", type(exc).__name__)
+        for kind, urls in BSE_DEAL_PAGES:
+            last = None
+            for attempt in range(2):
+                for url in urls:
+                    try:
+                        r = session.get(url, timeout=40)
+                        if r.status_code != 200:
+                            raise RuntimeError("BSE %s page answered %d (%s)" % (
+                                kind, r.status_code, page_hint(r.text)))
+                        got, on = parse_bse_deals(r.text, kind)
+                        deals += got
+                        as_on = as_on or on
+                        last = None
+                        break
+                    except Exception as exc:
+                        last = exc
+                if last is None:
+                    break
+                time.sleep(int(os.environ.get("BSE_DEAL_RETRY_WAIT", "10")))
+            if last is not None:
+                errors[kind] = last
+    return deals, as_on, errors
 
 
 def fetch_nse_deals(start, today):
@@ -571,12 +604,24 @@ def fmt_qty(q):
 def scan_bulk_deals(state, mailer, run, today, today_str, first_run):
     deals = []
     try:
-        got, as_on = fetch_bse_bulk()
+        got, as_on, errors = fetch_bse_deals()
         deals += got
-        run["bulk_bse"] = "OK - %d deals%s" % (len(got), " (as on %s)" % as_on if as_on else "")
+        counts = "%d bulk, %d block deals%s" % (
+            sum(d["kind"] == "bulk" for d in got), sum(d["kind"] == "block" for d in got),
+            " (as on %s)" % as_on if as_on else "")
+        for kind, exc in errors.items():
+            print("BSE %s deals failed:" % kind, type(exc).__name__, str(exc)[:300])
+        if not errors:
+            run["bulk_bse"] = "OK - " + counts
+        elif len(errors) == 2:
+            run["bulk_bse"] = "FAILED (%s) - today's BSE deals were NOT checked" % type(
+                errors["bulk"]).__name__
+        else:
+            run["bulk_bse"] = "FAILED for %s deals - not checked today; %s" % (
+                ", ".join(errors), counts)
     except Exception as exc:
-        run["bulk_bse"] = "FAILED (%s) - today's BSE bulk deals were NOT checked" % type(exc).__name__
-        print("BSE bulk deals failed:", type(exc).__name__, str(exc)[:200])
+        run["bulk_bse"] = "FAILED (%s) - today's BSE deals were NOT checked" % type(exc).__name__
+        print("BSE deals failed:", type(exc).__name__, str(exc)[:300])
     days = catch_up_days(state.get("bulk_nse_ok"), today, first_run)
     try:
         got, errors = fetch_nse_deals(days[0], today)
@@ -614,7 +659,7 @@ def scan_bulk_deals(state, mailer, run, today, today_str, first_run):
                 label, h[0], d["client"], d["exch"], d.get("kind", "bulk"), d["date"],
                 d["company"], d["code"],
                 d["side"], fmt_qty(d["qty"]), d["price"]))
-        lines += ["BSE: " + BSE_BULK_URL,
+        lines += ["BSE: " + BSE_BULK_URL + " (block deals: block_deals.aspx)",
                   "NSE: https://www.nseindia.in/market-data/large-deals"]
         sure = any(h[1] == "exact" for h, _ in found)
         kinds = sorted({d.get("kind", "bulk") for _, d in found}, reverse=True)
@@ -835,7 +880,7 @@ def send_summary(run, mailer, when):
         "",
         "Bulk + block deals    : %d new deals checked against your %d names" % (
             run["bulk_checked"], len(BULK_NAMES)),
-        "BSE bulk deals        : %s" % run["bulk_bse"],
+        "BSE bulk/block deals  : %s" % run["bulk_bse"],
         "NSE bulk/block deals  : %s" % run["bulk_nse"],
     ]
     if run["bse"] != "OK":
