@@ -56,10 +56,24 @@ DEEP_META = re.compile(
 
 
 # --- settings ----------------------------------------------------------------
+NUMBERED = {}
+
+
 def name_list(var):
+    """One name per line. Line numbers copied along with a list ("384<tab>Name",
+    "12. Name", "7) Name") are dropped."""
     raw = os.environ.get(var, "")
-    names = [n.strip() for n in re.split(r"[\n;]+", raw)]
-    return [n for n in names if n and not n.startswith("#")]
+    names, numbered = [], 0
+    for n in re.split(r"[\n;]+", raw):
+        n = n.strip()
+        cut = re.sub(r"^\d+(\s*[.):-]\s*|\t\s*)", "", n)
+        if cut != n and cut:
+            numbered += 1
+            n = cut.strip()
+        if n and not n.startswith("#"):
+            names.append(n)
+    NUMBERED[var] = numbered
+    return names
 
 
 ALLOTTEE_NAMES = name_list("ALLOTTEE_NAMES")
@@ -805,6 +819,24 @@ def scan_bulk_deals(state, mailer, run, today, today_str, first_run):
             found.append((h, d))
             keys.append(key)
     run["bulk_checked"] = len(deals)
+    # near misses: two or more whole words shared with a watch name, but no match
+    words = [(n, {t for t in name_tokens(n) if len(t) > 1}) for n in BULK_NAMES]
+    near = []
+    for d in deals:
+        if match_deal(BULK_NAMES, d["client"]):
+            continue
+        ct = {t for t in name_tokens(d["client"]) if len(t) > 1}
+        for n, ws in words:
+            if len(ws & ct) >= 2:
+                near.append("%s %s %s - %s: listed as %r, your list has %r" % (
+                    d["exch"], d["kind"], d["date"][:11], d["company"], d["client"], n))
+    run["bulk_near"] = near
+    odd = [n for n in BULK_NAMES if re.search(r"[0-9\t]|^\W|\W$", n.strip()) and not n.strip().endswith(")")]
+    run["bulk_list"] = "%d names%s%s" % (len(BULK_NAMES), (
+        "; line numbers removed from %d lines" % NUMBERED.get("BULK_NAMES", 0)
+        if NUMBERED.get("BULK_NAMES") else ""), (
+        "; %d have digits or stray characters, e.g. line %d" % (len(odd), BULK_NAMES.index(odd[0]) + 1)
+        if odd else ", all look clean"))
     if found:
         names = []
         for h, _ in found:
@@ -1041,7 +1073,11 @@ def send_summary(run, mailer, when):
             run["bulk_checked"], len(BULK_NAMES)),
         "BSE bulk/block deals  : %s" % run["bulk_bse"],
         "NSE bulk/block deals  : %s" % run["bulk_nse"],
+        "Bulk deal name list   : %s" % run.get("bulk_list", "not checked"),
     ]
+    if run.get("bulk_near"):
+        lines += ["", "Close but NOT matched (%d) - check these by eye:" % len(run["bulk_near"])]
+        lines += ["  " + x for x in run["bulk_near"][:25]]
     if run["bse"] != "OK":
         lines += ["", "BSE filings were NOT checked in this run. The next run catches "
                       "up automatically; you can also press Run workflow now."]
