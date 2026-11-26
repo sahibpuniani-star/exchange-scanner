@@ -524,10 +524,11 @@ def parse_bse_deals(html, kind):
     return deals, as_on.group(1) if as_on else ""
 
 
-BSE_DEAL_APIS = (
-    "https://api.bseindia.com/BseIndiaAPI/api/BulkBlockDeal/w",
-    "https://api.bseindia.com/BseIndiaAPI/api/BulkDeals/w",
-)
+BSE_API = "https://api.bseindia.com/BseIndiaAPI/api/"
+# BulkDeal_Beta is what BSE's own bulk deals page loads (seen in Chrome, 26 Nov 2026).
+# BlockDeal_Beta follows the same naming but has not been seen yet.
+BSE_DEAL_APIS = (("bulk", BSE_API + "BulkDeal_Beta/w"), ("block", BSE_API + "BlockDeal_Beta/w"))
+BSE_DEAL_APIS_OLD = (BSE_API + "BulkBlockDeal/w", BSE_API + "BulkDeals/w")
 
 
 def json_records(data, label=""):
@@ -550,7 +551,7 @@ def pick(rec, *patterns, avoid=None):
     return ""
 
 
-def deals_from_json(data):
+def deals_from_json(data, force_kind=None):
     """Reads deals from a BSE JSON answer without relying on exact field names."""
     deals = []
     for label, recs in json_records(data):
@@ -571,6 +572,8 @@ def deals_from_json(data):
                  "qty": pick(rec, r"qty|quantity"),
                  "price": pick(rec, r"price|rate|watp|value")}
             d["side"] = {"B": "BUY", "S": "SELL", "P": "BUY"}.get(d["side"].upper(), d["side"])
+            if force_kind:
+                d["kind"] = force_kind
             d["id"] = deal_id(d)
             deals.append(d)
     return deals
@@ -586,42 +589,72 @@ def json_shape(data):
     return "; ".join(parts)[:400] or type(data).__name__
 
 
+def bse_api_deals(session, url, force_kind=None):
+    """(deals, None) when BSE answered with readable deals (an empty list is fine on a
+    day without deals), or (None, reason)."""
+    name = url.split("/")[-2]
+    reason = None
+    for attempt in range(2):
+        try:
+            r = session.get(url, timeout=40)
+            if r.status_code != 200:
+                reason = "%s answered %d" % (name, r.status_code)
+            else:
+                try:
+                    data = r.json()
+                except ValueError:
+                    reason = "%s sent no JSON (%s)" % (name, page_hint(r.text))
+                    continue
+                got = deals_from_json(data, force_kind)
+                shape = json_shape(data)
+                print("BSE %s: %d deals - %s" % (name, len(got), shape))
+                has_records = any(recs for _, recs in json_records(data))
+                if got or not has_records:
+                    return got, None
+                return None, "%s has no client names in it (%s)" % (name, shape)
+        except Exception as exc:
+            reason = "%s: %s" % (name, type(exc).__name__)
+        time.sleep(int(os.environ.get("BSE_DEAL_RETRY_WAIT", "10")))
+    return None, reason
+
+
 def fetch_bse_deals():
-    """BSE's new website loads deals from its data service; the old report pages are
-    kept as a fallback. Returns (deals, as-on date, {kind: error})."""
-    deals, errors, as_on = [], {}, ""
+    """BSE's website loads deals from its data service; older addresses and the old
+    report pages are fallbacks. Returns (deals, note, {kind: error})."""
+    deals, errors, notes = [], {}, []
     with requests.Session() as session:
         session.headers.update({
             "User-Agent": UA, "Referer": "https://www.bseindia.com/",
             "Origin": "https://www.bseindia.com",
             "Accept": "application/json, text/plain, */*",
-            "Accept-Language": "en-US,en;q=0.9"})
+            "Accept-Language": "en-US,en;q=0.9",
+            "Sec-Fetch-Site": "same-site"})
         try:
             session.get("https://www.bseindia.com/", timeout=30)
         except Exception as exc:
             print("BSE home page not reachable:", type(exc).__name__)
-        notes = []
-        for url in BSE_DEAL_APIS:
-            try:
-                r = session.get(url, timeout=40)
-                if r.status_code != 200:
-                    notes.append("%s answered %d" % (url.split("/")[-2], r.status_code))
-                    continue
-                try:
-                    data = r.json()
-                except ValueError:
-                    notes.append("%s sent no JSON (%s)" % (url.split("/")[-2], page_hint(r.text)))
-                    continue
-                got = deals_from_json(data)
-                print("BSE %s: %d deals - %s" % (url.split("/")[-2], len(got), json_shape(data)))
-                if got:
-                    return got, "", {}
-                notes.append("%s had no client names (%s)" % (url.split("/")[-2], json_shape(data)))
-            except Exception as exc:
-                notes.append("%s: %s" % (url.split("/")[-2], type(exc).__name__))
+        found = {}
+        for kind, url in BSE_DEAL_APIS:
+            got, reason = bse_api_deals(session, url, kind)
+            if got is not None:
+                found[kind] = got
+            else:
+                notes.append(reason)
+        if "bulk" not in found:
+            for url in BSE_DEAL_APIS_OLD:
+                got, reason = bse_api_deals(session, url)
+                if got is not None:
+                    found["bulk"] = got
+                    break
+                notes.append(reason)
         if notes:
-            print("BSE data service:", " | ".join(notes)[:900])
-        # fallback: the old report pages
+            print("BSE data service:", " | ".join(n for n in notes if n)[:900])
+        if "bulk" in found:
+            deals = found["bulk"] + found.get("block", [])
+            note = "" if "block" in found else "block deals address not confirmed, bulk only"
+            return deals, note, {}
+
+        # last resort: the old report pages
         session.headers["Accept"] = "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8"
         session.headers.pop("Origin", None)
         for kind, urls in BSE_DEAL_PAGES:
@@ -635,7 +668,6 @@ def fetch_bse_deals():
                                 kind, r.status_code, page_hint(r.text)))
                         got, on = parse_bse_deals(r.text, kind)
                         deals += got
-                        as_on = as_on or on
                         last = None
                         break
                     except Exception as exc:
@@ -645,7 +677,7 @@ def fetch_bse_deals():
                 time.sleep(int(os.environ.get("BSE_DEAL_RETRY_WAIT", "10")))
             if last is not None:
                 errors[kind] = last
-    return deals, as_on, errors
+    return deals, "", errors
 
 
 def fetch_nse_deals(start, today):
@@ -694,11 +726,11 @@ def fmt_qty(q):
 def scan_bulk_deals(state, mailer, run, today, today_str, first_run):
     deals = []
     try:
-        got, as_on, errors = fetch_bse_deals()
+        got, note, errors = fetch_bse_deals()
         deals += got
         counts = "%d bulk, %d block deals%s" % (
             sum(d["kind"] == "bulk" for d in got), sum(d["kind"] == "block" for d in got),
-            " (as on %s)" % as_on if as_on else "")
+            " (%s)" % note if note else "")
         for kind, exc in errors.items():
             print("BSE %s deals failed:" % kind, type(exc).__name__, str(exc)[:300])
         if not errors:
