@@ -709,35 +709,78 @@ def fetch_bse_deals():
     return deals, "", errors
 
 
+def nse_deal(r, kind):
+    d = {"exch": "NSE", "kind": kind,
+         "date": str(r.get("BD_DT_DATE") or pick(r, r"^date$", r"date|dt")),
+         "code": str(r.get("BD_SYMBOL") or pick(r, r"symbol", r"scrip")),
+         "company": str(r.get("BD_SCRIP_NAME") or pick(
+             r, r"scrip.?name|company|security.?name|^name$", avoid=r"client") or r.get("BD_SYMBOL") or ""),
+         "client": str(r.get("BD_CLIENT_NAME") or pick(r, r"client", r"party")),
+         "side": str(r.get("BD_BUY_SELL") or pick(r, r"buy.?sell|transaction|deal.?type")),
+         "qty": r.get("BD_QTY_TRD") or pick(r, r"qty|quantity"),
+         "price": r.get("BD_TP_WATP") or pick(r, r"watp|price|rate")}
+    # the same deal can come from both NSE feeds with different formatting
+    d["id"] = short_id("D", "|".join([
+        "NSE", kind, d["date"].upper()[:11], d["code"].upper(), norm(d["client"]),
+        d["side"].upper()[:1], re.sub(r"\D", "", str(d["qty"]))]))
+    return d
+
+
 def fetch_nse_deals(start, today):
-    """NSE bulk and block deals for the dates. Returns (deals, {kind: error})."""
-    deals, errors = [], {}
+    """NSE bulk and block deals. The latest day comes from the Large Deals feed (the
+    data behind nseindia.in/market-data/large-deals, complete). Earlier days come from
+    the deals report, which NSE cuts off at 70 rows a request, so it is asked one day
+    at a time. Returns (deals, {kind: error})."""
+    deals, errors, seen_ids, capped = [], {}, set(), []
+
+    def add(d):
+        if d["client"].strip() and d["id"] not in seen_ids:
+            seen_ids.add(d["id"])
+            deals.append(d)
+
     with nse_open() as api:
+        # 1. the complete latest day
+        snap_ok = set()
+        try:
+            data = api._transport.request(api.base_url + "/snapshot-capital-market-largedeal").json()
+            for key, kind in (("BULK_DEALS_DATA", "bulk"), ("BLOCK_DEALS_DATA", "block")):
+                rows = [r for r in (data.get(key) or []) if isinstance(r, dict)]
+                if key in data:
+                    snap_ok.add(kind)
+                if rows:
+                    print("NSE large deals %s: %d rows (as on %s) - fields: %s" % (
+                        kind, len(rows), data.get("as_on_date", "?"), ", ".join(list(rows[0])[:10])))
+                for r in rows:
+                    add(nse_deal(r, kind))
+        except Exception as exc:
+            print("NSE large deals feed failed:", type(exc).__name__, str(exc)[:200])
+
+        # 2. the report, a day at a time, for catching up
         for option, kind in (("bulk_deals", "bulk"), ("block_deals", "block")):
-            try:
-                rows = api.bulk_deals(option, from_date=start, to_date=today)
-            except RuntimeError as exc:
-                if not str(exc).startswith("No "):   # "No ... data available" = none that day
-                    errors[kind] = exc
-                    continue
-                rows = []
-            except Exception as exc:
-                errors[kind] = exc
-                continue
-            rows = [r for r in rows or [] if isinstance(r, dict)]
-            if rows:
-                print("NSE %s deals: %d rows - fields: %s" % (kind, len(rows), ", ".join(list(rows[0])[:12])))
-            for r in rows:
-                d = {"exch": "NSE", "kind": kind,
-                     "date": str(r.get("BD_DT_DATE") or pick(r, r"date|dt")),
-                     "code": str(r.get("BD_SYMBOL") or pick(r, r"symbol", r"scrip")),
-                     "company": str(r.get("BD_SCRIP_NAME") or pick(r, r"scrip.?name|company|security.?name|name", avoid=r"client") or r.get("BD_SYMBOL") or ""),
-                     "client": str(r.get("BD_CLIENT_NAME") or pick(r, r"client", r"party")),
-                     "side": str(r.get("BD_BUY_SELL") or pick(r, r"buy.?sell|transaction|deal.?type")),
-                     "qty": r.get("BD_QTY_TRD") or pick(r, r"qty|quantity"),
-                     "price": r.get("BD_TP_WATP") or pick(r, r"price|watp|rate")}
-                d["id"] = deal_id(d)
-                deals.append(d)
+            day, failed = start, None
+            while day <= today:
+                try:
+                    rows = api.bulk_deals(option, from_date=day, to_date=day)
+                except RuntimeError as exc:
+                    rows = []
+                    if not str(exc).startswith("No "):   # "No ... data available" = none that day
+                        failed = exc
+                except Exception as exc:
+                    rows, failed = [], exc
+                rows = [r for r in rows or [] if isinstance(r, dict)]
+                if len(rows) >= 70:
+                    capped.append("%s %s" % (kind, day.strftime("%d %b")))
+                for r in rows:
+                    add(nse_deal(r, kind))
+                day += timedelta(days=1)
+            if failed is not None and kind not in snap_ok:
+                errors[kind] = failed
+    if capped:
+        print("NSE deals report cut off at 70 rows for: %s (the Large Deals feed covers "
+              "the latest day in full)" % ", ".join(capped))
+        if not snap_ok:
+            errors["cut-off"] = RuntimeError(
+                "only the first 70 deals were readable for " + ", ".join(capped))
     return deals, errors
 
 
@@ -790,12 +833,12 @@ def scan_bulk_deals(state, mailer, run, today, today_str, first_run):
         if not errors:
             state["bulk_nse_ok"] = today_str
             run["bulk_nse"] = "OK - " + counts
-        elif len(errors) == 2:
+        elif "bulk" in errors and "block" in errors:
             run["bulk_nse"] = "FAILED (%s) - the next run catches up" % type(
                 errors["bulk"]).__name__
         else:
-            run["bulk_nse"] = "FAILED for %s deals (%s) - the next run catches up; %s" % (
-                ", ".join(errors), type(list(errors.values())[0]).__name__, counts)
+            run["bulk_nse"] = "FAILED for %s (%s) - some NSE deals were NOT checked; %s" % (
+                ", ".join(errors), str(list(errors.values())[0])[:90], counts)
     except Exception as exc:
         run["bulk_nse"] = "FAILED (%s) - the next run catches up" % type(exc).__name__
         print("NSE bulk/block deals failed:", type(exc).__name__, str(exc)[:200])
