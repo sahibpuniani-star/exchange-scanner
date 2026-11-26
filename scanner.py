@@ -710,13 +710,18 @@ def fetch_nse_deals(start, today):
             except Exception as exc:
                 errors[kind] = exc
                 continue
-            for r in rows or []:
-                d = {"exch": "NSE", "kind": kind, "date": str(r.get("BD_DT_DATE") or ""),
-                     "code": str(r.get("BD_SYMBOL") or ""),
-                     "company": str(r.get("BD_SCRIP_NAME") or r.get("BD_SYMBOL") or ""),
-                     "client": str(r.get("BD_CLIENT_NAME") or ""),
-                     "side": str(r.get("BD_BUY_SELL") or ""),
-                     "qty": r.get("BD_QTY_TRD") or "", "price": r.get("BD_TP_WATP") or ""}
+            rows = [r for r in rows or [] if isinstance(r, dict)]
+            if rows:
+                print("NSE %s deals: %d rows - fields: %s" % (kind, len(rows), ", ".join(list(rows[0])[:12])))
+            for r in rows:
+                d = {"exch": "NSE", "kind": kind,
+                     "date": str(r.get("BD_DT_DATE") or pick(r, r"date|dt")),
+                     "code": str(r.get("BD_SYMBOL") or pick(r, r"symbol", r"scrip")),
+                     "company": str(r.get("BD_SCRIP_NAME") or pick(r, r"scrip.?name|company|security.?name|name", avoid=r"client") or r.get("BD_SYMBOL") or ""),
+                     "client": str(r.get("BD_CLIENT_NAME") or pick(r, r"client", r"party")),
+                     "side": str(r.get("BD_BUY_SELL") or pick(r, r"buy.?sell|transaction|deal.?type")),
+                     "qty": r.get("BD_QTY_TRD") or pick(r, r"qty|quantity"),
+                     "price": r.get("BD_TP_WATP") or pick(r, r"price|watp|rate")}
                 d["id"] = deal_id(d)
                 deals.append(d)
     return deals, errors
@@ -781,6 +786,13 @@ def scan_bulk_deals(state, mailer, run, today, today_str, first_run):
         run["bulk_nse"] = "FAILED (%s) - the next run catches up" % type(exc).__name__
         print("NSE bulk/block deals failed:", type(exc).__name__, str(exc)[:200])
 
+    for exch in ("BSE", "NSE"):
+        mine = [d for d in deals if d["exch"] == exch]
+        if mine:
+            dates = sorted({d["date"][:11] for d in mine})
+            print("%s deals read: %d, without a client name: %d, dates: %s, first clients: %s" % (
+                exch, len(mine), sum(1 for d in mine if not d["client"].strip()),
+                ", ".join(dates[:4]), " | ".join(d["client"] for d in mine[:3])))
     # Every deal fetched is checked on every run (a few hundred at most), so names
     # added to the list are also checked against deals seen before. A deal is emailed
     # once per watch name.
