@@ -726,30 +726,39 @@ def nse_deal(r, kind):
     return d
 
 
-def fetch_nse_deals(start, today):
+def nse_day(text):
+    try:
+        return datetime.strptime(str(text).strip()[:11], "%d-%b-%Y").date()
+    except ValueError:
+        return None
+
+
+def fetch_nse_deals(start, today, full_days):
     """NSE bulk and block deals. The latest day comes from the Large Deals feed (the
     data behind nseindia.in/market-data/large-deals, complete). Earlier days come from
-    the deals report, which NSE cuts off at 70 rows a request, so it is asked one day
-    at a time. Returns (deals, {kind: error})."""
-    deals, errors, seen_ids, capped = [], {}, set(), []
+    the deals report, which NSE cuts off at 70 rows a request. A cut-off day is fine if
+    an earlier run read it in full (full_days); otherwise it is reported.
+    Returns (deals, {problem: error}, per-day counts text, days read in full now)."""
+    deals, errors, seen_ids, capped = [], {}, set(), set()
 
     def add(d):
         if d["client"].strip() and d["id"] not in seen_ids:
             seen_ids.add(d["id"])
             deals.append(d)
 
+    snap_day, snap_ok = None, set()
     with nse_open() as api:
         # 1. the complete latest day
-        snap_ok = set()
         try:
             data = api._transport.request(api.base_url + "/snapshot-capital-market-largedeal").json()
+            snap_day = nse_day(data.get("as_on_date", ""))
             for key, kind in (("BULK_DEALS_DATA", "bulk"), ("BLOCK_DEALS_DATA", "block")):
                 rows = [r for r in (data.get(key) or []) if isinstance(r, dict)]
                 if key in data:
                     snap_ok.add(kind)
-                if rows:
-                    print("NSE large deals %s: %d rows (as on %s) - fields: %s" % (
-                        kind, len(rows), data.get("as_on_date", "?"), ", ".join(list(rows[0])[:10])))
+                print("NSE large deals %s: %d rows (as on %s)%s" % (
+                    kind, len(rows), data.get("as_on_date", "?"),
+                    " - fields: " + ", ".join(list(rows[0])[:10]) if rows else ""))
                 for r in rows:
                     add(nse_deal(r, kind))
         except Exception as exc:
@@ -769,19 +778,40 @@ def fetch_nse_deals(start, today):
                     rows, failed = [], exc
                 rows = [r for r in rows or [] if isinstance(r, dict)]
                 if len(rows) >= 70:
-                    capped.append("%s %s" % (kind, day.strftime("%d %b")))
+                    capped.add((kind, day))
                 for r in rows:
                     add(nse_deal(r, kind))
                 day += timedelta(days=1)
             if failed is not None and kind not in snap_ok:
                 errors[kind] = failed
-    if capped:
-        print("NSE deals report cut off at 70 rows for: %s (the Large Deals feed covers "
-              "the latest day in full)" % ", ".join(capped))
-        if not snap_ok:
-            errors["cut-off"] = RuntimeError(
-                "only the first 70 deals were readable for " + ", ".join(capped))
-    return deals, errors
+
+    full_now = set()
+    if snap_day:
+        full_now = {snap_day.isoformat()}
+    complete = set(full_days) | full_now
+    missing = sorted((k, d) for k, d in capped if d.isoformat() not in complete)
+    if missing:
+        errors["cut-off"] = RuntimeError("only the first 70 %s deals could be read for %s" % (
+            "/".join(sorted({k for k, _ in missing})),
+            ", ".join(sorted({d.strftime("%d %b") for _, d in missing}))))
+
+    # per-day counts, to compare with NSE's own page
+    parts = []
+    for kind in ("bulk", "block"):
+        per = {}
+        for d in deals:
+            if d["kind"] == kind:
+                day = nse_day(d["date"])
+                per[day] = per.get(day, 0) + 1
+        items = []
+        for day in sorted(x for x in per if x):
+            note = ""
+            if (kind, day) in capped and day != snap_day:
+                note = " (cut off at 70; read in full on an earlier run)" \
+                    if day.isoformat() in complete else " (cut off at 70 - NOT complete)"
+            items.append("%s %d%s" % (day.strftime("%d %b"), per[day], note))
+        parts.append("%s: %s" % (kind, ", ".join(items) or "none"))
+    return deals, errors, " | ".join(parts), full_now
 
 
 def fmt_qty(q):
@@ -823,11 +853,16 @@ def scan_bulk_deals(state, mailer, run, today, today_str, first_run):
         print("BSE deals failed:", type(exc).__name__, str(exc)[:300])
     days = catch_up_days(state.get("bulk_nse_ok"), today, first_run)
     try:
-        got, errors = fetch_nse_deals(days[0], today)
+        if "nse_full_days" not in state:
+            # the version before this one read 25 and 26 Nov 2026 in full but did not
+            # record it; remember them once so they are not reported as incomplete
+            state["nse_full_days"] = ["2026-11-25", "2026-11-26"]
+        got, errors, counts, full_now = fetch_nse_deals(
+            days[0], today, state.get("nse_full_days", []))
         deals += got
-        counts = "%d bulk, %d block deals from %s to %s" % (
-            sum(d["kind"] == "bulk" for d in got), sum(d["kind"] == "block" for d in got),
-            days[0].strftime("%d %b"), today.strftime("%d %b"))
+        keep_days = (today - timedelta(days=10)).isoformat()
+        state["nse_full_days"] = sorted(
+            d for d in set(state.get("nse_full_days", [])) | full_now if d >= keep_days)
         for kind, exc in errors.items():
             print("NSE %s deals failed:" % kind, type(exc).__name__, str(exc)[:200])
         if not errors:
